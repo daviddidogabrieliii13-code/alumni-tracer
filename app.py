@@ -2,6 +2,8 @@ import os
 import secrets
 import sqlite3
 import smtplib
+import csv
+import io
 import time
 import hmac
 import hashlib
@@ -10,7 +12,17 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
 
-from flask import Flask, abort, render_template, redirect, url_for, request, flash, session
+from flask import (
+    Flask,
+    Response,
+    abort,
+    render_template,
+    redirect,
+    url_for,
+    request,
+    flash,
+    session,
+)
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from sqlalchemy import or_, func
 from werkzeug.utils import secure_filename
@@ -57,9 +69,13 @@ login_manager.login_message_category = "warning"
 login_manager.init_app(app)
 
 app.config.setdefault("OTP_EXPIRY_SECONDS", 300)
-app.config.setdefault("SHOW_OTP_IN_UI", True)
+app.config.setdefault("SHOW_OTP_IN_UI", False)
 app.config.setdefault("OTP_MODE", "totp")
 app.config.setdefault("OTP_TIMESTEP_SECONDS", 30)
+app.config.setdefault("OTP_MAX_ATTEMPTS", 5)
+app.config.setdefault("OTP_RESEND_COOLDOWN_SECONDS", 45)
+app.config.setdefault("OTP_LOCKOUT_SECONDS", 300)
+app.config.setdefault("RSVP_ALLOWED_ROLES", "alumni")
 try:
     app.config["OTP_EXPIRY_SECONDS"] = int(
         os.environ.get("OTP_EXPIRY_SECONDS", app.config["OTP_EXPIRY_SECONDS"])
@@ -73,6 +89,22 @@ try:
     )
 except (TypeError, ValueError):
     app.config["OTP_TIMESTEP_SECONDS"] = 30
+
+for key, fallback in {
+    "OTP_MAX_ATTEMPTS": 5,
+    "OTP_RESEND_COOLDOWN_SECONDS": 45,
+    "OTP_LOCKOUT_SECONDS": 300,
+}.items():
+    try:
+        app.config[key] = int(os.environ.get(key, app.config.get(key, fallback)))
+    except (TypeError, ValueError):
+        app.config[key] = fallback
+
+app.config["RSVP_ALLOWED_ROLES"] = (
+    str(os.environ.get("RSVP_ALLOWED_ROLES", app.config.get("RSVP_ALLOWED_ROLES", "alumni")) or "")
+    .strip()
+    or "alumni"
+)
 
 otp_mode_env = str(os.environ.get("OTP_MODE", app.config["OTP_MODE"])).strip().lower()
 if otp_mode_env in {"totp", "hotp"}:
@@ -105,6 +137,8 @@ ROLE_ALIASES = {
     "office of student affairs": "osa",
     "student affairs": "osa",
     "osa portal": "osa",
+    "student": "alumni",
+    "students": "alumni",
 }
 
 DEGREE_OPTIONS = [
@@ -137,6 +171,14 @@ RSVP_ATTEND = "attend"
 RSVP_MAYBE = "maybe"
 RSVP_NOT_ATTEND = "not_attend"
 RSVP_STATUSES = {RSVP_ATTEND, RSVP_MAYBE, RSVP_NOT_ATTEND}
+RSVP_SUBMIT_STATUSES = {RSVP_ATTEND, RSVP_NOT_ATTEND}
+RSVP_STATUS_LABELS = {
+    RSVP_ATTEND: "Attending",
+    RSVP_MAYBE: "Maybe",
+    RSVP_NOT_ATTEND: "Not Attending",
+}
+
+EVENT_TYPE_OPTIONS = {"reunion", "career_fair", "workshop", "gathering"}
 
 ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 PROFILE_PHOTO_WEB_PREFIX = "uploads/profile_photos/"
@@ -186,6 +228,26 @@ def clean_text(value):
     return (value or "").strip()
 
 
+def rsvp_status_label(status):
+    return RSVP_STATUS_LABELS.get(clean_text(status).lower(), "Unknown")
+
+
+def email_domain(email):
+    value = clean_text(email).lower()
+    if "@" not in value:
+        return ""
+    return value.rsplit("@", 1)[1]
+
+
+def is_gmail_email(email):
+    return email_domain(email) == "gmail.com"
+
+
+def is_school_or_alumni_email(email):
+    domain = email_domain(email)
+    return domain == "wvsu.edu.ph" or domain.endswith(".wvsu.edu.ph")
+
+
 def to_role_slug(value, default=None):
     normalized = normalize_role(value)
     if normalized in ROLE_PORTALS:
@@ -217,6 +279,28 @@ def require_role_slug(value):
 
 def role_requires_approval(role_slug):
     return role_slug in APPROVAL_REQUIRED_ROLES
+
+
+def get_rsvp_allowed_roles():
+    configured = clean_text(app.config.get("RSVP_ALLOWED_ROLES", "alumni")).lower()
+    candidates = [item.strip() for item in configured.split(",") if item.strip()]
+    allowed = set()
+    # Preserve all configured RSVP roles (student/teacher/etc. mappings)
+    # while guaranteeing alumni RSVP access is always enabled.
+    for candidate in candidates:
+        mapped = to_role_slug(candidate)
+        if mapped in ROLE_PORTALS:
+            allowed.add(mapped)
+    allowed.add("alumni")
+    allowed.add("admin")
+    return allowed
+
+
+def can_user_submit_rsvp(user):
+    if not user or not getattr(user, "is_authenticated", False):
+        return False
+    role_slug = to_role_slug(getattr(user, "role", None), default="alumni")
+    return role_slug in get_rsvp_allowed_roles()
 
 
 def normalize_approval_status(value):
@@ -255,6 +339,7 @@ def infer_portal_role_from_endpoint():
         "survey",
         "my_survey",
         "dashboard_overview",
+        "event_rsvp",
     }:
         return "alumni"
     return None
@@ -292,6 +377,7 @@ def clear_otp_context():
     session.pop(OTP_SESSION_KEY, None)
     session.pop("otp_email", None)
     session.pop("otp_demo", None)
+    session.pop("otp_delivery", None)
 
 
 def parse_utc_iso(value):
@@ -301,6 +387,32 @@ def parse_utc_iso(value):
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def otp_max_attempts():
+    try:
+        return max(1, int(app.config.get("OTP_MAX_ATTEMPTS", 5)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def otp_resend_cooldown_seconds():
+    try:
+        return max(0, int(app.config.get("OTP_RESEND_COOLDOWN_SECONDS", 45)))
+    except (TypeError, ValueError):
+        return 45
+
+
+def otp_lockout_seconds():
+    try:
+        return max(30, int(app.config.get("OTP_LOCKOUT_SECONDS", 300)))
+    except (TypeError, ValueError):
+        return 300
+
+
+def set_otp_context(context):
+    session[OTP_SESSION_KEY] = context
+    session.modified = True
 
 
 def generate_otp():
@@ -329,15 +441,31 @@ def generate_totp(secret_bytes, timestep=30, digits=6):
 
 
 def send_otp(email, otp, role_slug="alumni"):
+    normalized_email = clean_text(email).lower()
+    # School/alumni emails use on-screen OTP only (no SMTP send).
+    if is_school_or_alumni_email(normalized_email):
+        return "ui"
+
+    # Gmail/external addresses are sent through SMTP using Config mail settings.
     resolved_role = to_role_slug(role_slug, default="alumni")
     portal_name = ROLE_PORTALS.get(resolved_role, ROLE_PORTALS["alumni"]).get(
         "label", "Alumni"
     )
-    smtp_server = clean_text(os.environ.get("MAIL_SERVER", app.config.get("MAIL_SERVER")))
+    smtp_server = clean_text(
+        os.environ.get("MAIL_SERVER", app.config.get("MAIL_SERVER", "smtp.gmail.com"))
+    ) or "smtp.gmail.com"
     smtp_username = clean_text(
         os.environ.get("MAIL_USERNAME", app.config.get("MAIL_USERNAME"))
     )
-    smtp_password = os.environ.get("MAIL_PASSWORD", app.config.get("MAIL_PASSWORD"))
+    smtp_password = (
+        os.environ.get("MAIL_PASSWORD")
+        or os.environ.get("GMAIL_APP_PASSWORD")
+        or app.config.get("MAIL_PASSWORD")
+    )
+    smtp_from = (
+        clean_text(os.environ.get("MAIL_FROM", app.config.get("MAIL_FROM")))
+        or smtp_username
+    )
     smtp_port = app.config.get("MAIL_PORT", 587)
     try:
         smtp_port = int(os.environ.get("MAIL_PORT", smtp_port))
@@ -350,64 +478,71 @@ def send_otp(email, otp, role_slug="alumni"):
     else:
         use_tls = use_tls_env.strip().lower() in {"1", "true", "yes", "on"}
 
-    if smtp_server and smtp_username and smtp_password:
-        minutes = max(1, app.config.get("OTP_EXPIRY_SECONDS", 300) // 60)
-        message = EmailMessage()
-        message["Subject"] = f"WVSU {portal_name} Portal OTP Verification"
-        message["From"] = smtp_username
-        message["To"] = email
-        message.set_content(
-            (
-                f"Your one-time password for the WVSU {portal_name} Portal is "
-                f"{otp}. It expires in about {minutes} minutes."
-            )
+    if not smtp_username or not smtp_password:
+        raise RuntimeError(
+            "OTP email is not configured. Set MAIL_USERNAME and MAIL_PASSWORD (Gmail App Password)."
         )
-        try:
-            with smtplib.SMTP(smtp_server, smtp_port, timeout=12) as smtp:
-                if use_tls:
-                    smtp.starttls()
-                smtp.login(smtp_username, smtp_password)
-                smtp.send_message(message)
-            return
-        except Exception as exc:
-            print(f"Failed to send OTP email to {email}: {exc}")
 
-    print(f"OTP for {email} ({portal_name} portal): {otp}")
+    minutes = max(1, app.config.get("OTP_EXPIRY_SECONDS", 300) // 60)
+    message = EmailMessage()
+    message["Subject"] = "OTP Verification Code"
+    message["From"] = smtp_from
+    message["To"] = normalized_email
+    message.set_content(
+        (
+            f"Hello,\n\n"
+            f"Your OTP verification code for the WVSU {portal_name} Portal is: {otp}\n\n"
+            f"This code expires in {minutes} minute(s).\n"
+            f"If you did not request this code, please ignore this email.\n\n"
+            f"Regards,\nWVSU Alumni Tracking System"
+        )
+    )
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as smtp:
+            if use_tls:
+                smtp.starttls()
+            smtp.login(smtp_username, smtp_password)
+            smtp.send_message(message)
+        return "smtp"
+    except Exception as exc:
+        raise RuntimeError(
+            "We could not deliver the OTP email right now. Please try again."
+        ) from exc
 
 
 def issue_otp(user, purpose, role_slug):
-    otp_mode = clean_text(os.environ.get("OTP_MODE", app.config.get("OTP_MODE", "totp"))).lower()
-    if otp_mode not in {"totp", "hotp"}:
-        otp_mode = "totp"
-
-    otp_secret = secrets.token_bytes(20)
-    otp_counter = None
-    if otp_mode == "hotp":
-        otp_counter = secrets.randbelow(10_000_000_000)
-        otp_code = generate_hotp(otp_secret, otp_counter)
-    else:
-        otp_code, otp_counter = generate_totp(
-            otp_secret,
-            timestep=app.config.get("OTP_TIMESTEP_SECONDS", 30),
-        )
-
+    resolved_role = to_role_slug(role_slug, default="alumni")
+    otp_code = generate_otp()
     user.set_otp(otp_code)
-    expires_at = datetime.utcnow() + timedelta(seconds=app.config["OTP_EXPIRY_SECONDS"])
-    session[OTP_SESSION_KEY] = {
-        "email": user.email,
-        "role": role_slug,
-        "purpose": purpose,
-        "otp_mode": otp_mode,
-        "otp_counter": otp_counter,
-        "expires_at": expires_at.isoformat(),
-        "request_id": secrets.token_urlsafe(8),
-    }
+    issued_at = datetime.utcnow()
+    expires_at = issued_at + timedelta(seconds=app.config["OTP_EXPIRY_SECONDS"])
+    resend_available_at = issued_at + timedelta(seconds=otp_resend_cooldown_seconds())
+    set_otp_context(
+        {
+            "email": user.email,
+            "role": resolved_role,
+            "purpose": purpose,
+            "attempts": 0,
+            "max_attempts": otp_max_attempts(),
+            "lock_until": None,
+            "created_at": issued_at.isoformat(),
+            "last_sent_at": issued_at.isoformat(),
+            "resend_available_at": resend_available_at.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "request_id": secrets.token_urlsafe(8),
+        }
+    )
     session["otp_email"] = user.email
-    if app.config.get("SHOW_OTP_IN_UI"):
+    delivery_mode = send_otp(user.email, otp_code, role_slug=resolved_role)
+    session["otp_delivery"] = delivery_mode
+    # UI OTP display branch: always show for school/alumni addresses.
+    if delivery_mode == "ui":
+        session["otp_demo"] = otp_code
+    elif app.config.get("SHOW_OTP_IN_UI"):
         session["otp_demo"] = otp_code
     else:
         session.pop("otp_demo", None)
-    send_otp(user.email, otp_code, role_slug=role_slug)
     return otp_code
 
 
@@ -422,6 +557,64 @@ def get_otp_context(email=None, role_slug=None, purpose=None):
     if purpose and context.get("purpose") != purpose:
         return None
     return context
+
+
+def get_otp_max_attempts(context):
+    if not context:
+        return otp_max_attempts()
+    try:
+        return max(1, int(context.get("max_attempts", otp_max_attempts())))
+    except (TypeError, ValueError):
+        return otp_max_attempts()
+
+
+def get_otp_attempts_remaining(context):
+    if not context:
+        return 0
+    try:
+        attempts = max(0, int(context.get("attempts", 0)))
+    except (TypeError, ValueError):
+        attempts = 0
+    return max(0, get_otp_max_attempts(context) - attempts)
+
+
+def is_otp_context_locked(context):
+    lock_until = parse_utc_iso(context.get("lock_until")) if context else None
+    if not lock_until:
+        return False
+    return datetime.utcnow() < lock_until
+
+
+def get_otp_lock_seconds_remaining(context):
+    lock_until = parse_utc_iso(context.get("lock_until")) if context else None
+    if not lock_until:
+        return 0
+    return max(0, int((lock_until - datetime.utcnow()).total_seconds()))
+
+
+def get_otp_resend_wait_seconds(context):
+    resend_available_at = (
+        parse_utc_iso(context.get("resend_available_at")) if context else None
+    )
+    if not resend_available_at:
+        return 0
+    return max(0, int((resend_available_at - datetime.utcnow()).total_seconds()))
+
+
+def register_otp_failure(context):
+    if not context:
+        return 0
+    try:
+        current_attempts = int(context.get("attempts", 0))
+    except (TypeError, ValueError):
+        current_attempts = 0
+    current_attempts = max(0, current_attempts) + 1
+    context["attempts"] = current_attempts
+    if current_attempts >= get_otp_max_attempts(context):
+        lock_until = datetime.utcnow() + timedelta(seconds=otp_lockout_seconds())
+        context["lock_until"] = lock_until.isoformat()
+    set_otp_context(context)
+    return get_otp_attempts_remaining(context)
 
 
 def is_otp_context_expired(context):
@@ -498,6 +691,7 @@ def inject_role():
         "current_role": role_value,
         "current_dashboard_url": current_dashboard_url,
         "role_portals": ROLE_PORTALS,
+        "rsvp_allowed_roles": sorted(get_rsvp_allowed_roles()),
         "campus_logo_static_path": url_for("static", filename=CAMPUS_LOGO_FILE),
     }
 
@@ -516,6 +710,11 @@ def profile_initials(profile):
 def role_display_name(role_value):
     role_slug = to_role_slug(role_value, default="alumni")
     return role_label(role_slug)
+
+
+@app.template_filter("rsvp_label")
+def rsvp_label_filter(status):
+    return rsvp_status_label(status)
 
 
 @app.before_request
@@ -566,6 +765,15 @@ def parse_datetime_local(value):
         return datetime.strptime(value, "%Y-%m-%dT%H:%M")
     except ValueError:
         return None
+
+
+def normalize_event_type(value):
+    normalized = clean_text(value).lower().replace("-", "_")
+    if not normalized:
+        return None
+    if normalized in EVENT_TYPE_OPTIONS:
+        return normalized
+    return None
 
 
 def is_valid_email(value):
@@ -967,13 +1175,25 @@ def handle_portal_registration(role_slug):
             )
             db.session.add(profile)
 
-        issue_otp(user, OTP_PURPOSE_REGISTRATION, role_slug)
+        try:
+            issue_otp(user, OTP_PURPOSE_REGISTRATION, role_slug)
+        except RuntimeError as exc:
+            db.session.rollback()
+            clear_otp_context()
+            flash(str(exc), "danger")
+            return render_template(template_name, **template_context)
 
         if not safe_commit("Registration failed. Please try again."):
             clear_otp_context()
             return render_template(template_name, **template_context)
 
-        flash("OTP sent. Please verify to complete registration.", "success")
+        if is_school_or_alumni_email(email):
+            flash(
+                "OTP generated for your school/alumni email. Please use the on-screen OTP to complete verification.",
+                "success",
+            )
+        else:
+            flash("OTP sent to your email. Please verify to complete registration.", "success")
         return redirect(
             url_for(
                 "verify_otp",
@@ -1039,7 +1259,13 @@ def handle_portal_login(role_slug):
             if not user.otp_verified
             else OTP_PURPOSE_LOGIN
         )
-        issue_otp(user, otp_purpose, role_slug)
+        try:
+            issue_otp(user, otp_purpose, role_slug)
+        except RuntimeError as exc:
+            db.session.rollback()
+            clear_otp_context()
+            flash(str(exc), "danger")
+            return render_template(template_name, **template_context)
         next_target = clean_text(request.form.get("next")) or request.args.get("next")
         session[POST_LOGIN_NEXT_KEY] = (
             next_target
@@ -1051,11 +1277,18 @@ def handle_portal_login(role_slug):
             clear_otp_context()
             return render_template(template_name, **template_context)
 
-        message = (
-            "OTP sent. Verify to activate your account."
-            if otp_purpose == OTP_PURPOSE_REGISTRATION
-            else "OTP sent. Verify to complete sign in."
-        )
+        if is_school_or_alumni_email(email):
+            message = (
+                "OTP generated on screen. Verify to activate your account."
+                if otp_purpose == OTP_PURPOSE_REGISTRATION
+                else "OTP generated on screen. Verify to complete sign in."
+            )
+        else:
+            message = (
+                "OTP sent to your email. Verify to activate your account."
+                if otp_purpose == OTP_PURPOSE_REGISTRATION
+                else "OTP sent to your email. Verify to complete sign in."
+            )
         flash(message, "success")
         return redirect(
             url_for(
@@ -1171,7 +1404,16 @@ def ensure_sqlite_schema():
             conn = sqlite3.connect(db_file)
             cursor = conn.cursor()
 
+            def table_exists(table_name):
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table_name,),
+                )
+                return cursor.fetchone() is not None
+
             def add_missing_columns(table_name, column_defs):
+                if not table_exists(table_name):
+                    return
                 cursor.execute(f'PRAGMA table_info("{table_name}")')
                 existing_columns = {row[1] for row in cursor.fetchall()}
                 for column_name, ddl in column_defs.items():
@@ -1212,6 +1454,78 @@ def ensure_sqlite_schema():
                         "enrollment_date": "DATE",
                         "expected_completion_date": "DATE",
                     },
+                )
+
+                created_rsvps_table = False
+                if not table_exists("rsvps"):
+                    created_rsvps_table = True
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS rsvps (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
+                            event_id INTEGER NOT NULL,
+                            status VARCHAR(20) NOT NULL,
+                            timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at DATETIME,
+                            FOREIGN KEY (user_id) REFERENCES user(id),
+                            FOREIGN KEY (event_id) REFERENCES event(id),
+                            CONSTRAINT uq_rsvps_user_event UNIQUE (user_id, event_id)
+                        )
+                        """
+                    )
+
+                add_missing_columns(
+                    "rsvps",
+                    {
+                        "timestamp": "DATETIME",
+                        "created_at": "DATETIME",
+                        "updated_at": "DATETIME",
+                    },
+                )
+
+                if created_rsvps_table and table_exists("event_rsvp"):
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO rsvps (
+                            id,
+                            user_id,
+                            event_id,
+                            status,
+                            timestamp,
+                            created_at,
+                            updated_at
+                        )
+                        SELECT
+                            id,
+                            user_id,
+                            event_id,
+                            status,
+                            COALESCE(created_at, CURRENT_TIMESTAMP),
+                            COALESCE(created_at, CURRENT_TIMESTAMP),
+                            updated_at
+                        FROM event_rsvp
+                        """
+                    )
+
+                cursor.execute(
+                    "UPDATE rsvps SET timestamp = COALESCE(timestamp, created_at, CURRENT_TIMESTAMP)"
+                )
+                cursor.execute(
+                    "UPDATE rsvps SET created_at = COALESCE(created_at, timestamp, CURRENT_TIMESTAMP)"
+                )
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_rsvps_user_event ON rsvps(user_id, event_id)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_rsvps_status ON rsvps(status)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_rsvps_event_id ON rsvps(event_id)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_rsvps_user_id ON rsvps(user_id)"
                 )
                 conn.commit()
             finally:
@@ -1328,6 +1642,21 @@ def verify_otp():
                 )
             )
 
+        if is_otp_context_locked(otp_context):
+            wait_seconds = get_otp_lock_seconds_remaining(otp_context)
+            flash(
+                f"Too many invalid OTP attempts. Try again in {wait_seconds} second(s) or request a new OTP.",
+                "danger",
+            )
+            return redirect(
+                url_for(
+                    "verify_otp",
+                    email=email,
+                    role=role_slug,
+                    purpose=purpose,
+                )
+            )
+
         user = User.query.filter_by(email=email).first()
         if not user:
             clear_otp_context()
@@ -1347,8 +1676,41 @@ def verify_otp():
             )
             return redirect(role_login_url(account_role))
 
+        if not re.fullmatch(r"\d{6}", otp):
+            attempts_left = register_otp_failure(otp_context)
+            if attempts_left <= 0:
+                wait_seconds = get_otp_lock_seconds_remaining(otp_context)
+                flash(
+                    f"Too many invalid OTP attempts. Try again in {wait_seconds} second(s) or request a new OTP.",
+                    "danger",
+                )
+            else:
+                flash(
+                    f"Invalid OTP format. {attempts_left} attempt(s) remaining.",
+                    "danger",
+                )
+            return redirect(
+                url_for(
+                    "verify_otp",
+                    email=email,
+                    role=role_slug,
+                    purpose=purpose,
+                )
+            )
+
         if not user.verify_otp(otp):
-            flash("Invalid OTP. Please try again.", "danger")
+            attempts_left = register_otp_failure(otp_context)
+            if attempts_left <= 0:
+                wait_seconds = get_otp_lock_seconds_remaining(otp_context)
+                flash(
+                    f"Too many invalid OTP attempts. Try again in {wait_seconds} second(s) or request a new OTP.",
+                    "danger",
+                )
+            else:
+                flash(
+                    f"Invalid OTP. {attempts_left} attempt(s) remaining.",
+                    "danger",
+                )
             return redirect(
                 url_for(
                     "verify_otp",
@@ -1488,7 +1850,12 @@ def verify_otp():
         role_label=role_label(context_role),
         purpose=context_purpose,
         otp=session.get("otp_demo"),
+        otp_delivery=session.get("otp_delivery"),
         expires_in=get_otp_seconds_remaining(otp_context),
+        attempts_remaining=get_otp_attempts_remaining(otp_context),
+        max_attempts=get_otp_max_attempts(otp_context),
+        lock_seconds=get_otp_lock_seconds_remaining(otp_context),
+        resend_wait_seconds=get_otp_resend_wait_seconds(otp_context),
         login_url=role_login_url(context_role),
         register_url=role_register_url(context_role),
     )
@@ -1563,12 +1930,38 @@ def resend_otp():
             )
             return redirect(role_login_url(role_slug))
 
-    issue_otp(user, purpose, role_slug)
+    cooldown_context = get_otp_context(email=email, role_slug=role_slug, purpose=purpose)
+    resend_wait = get_otp_resend_wait_seconds(cooldown_context)
+    if resend_wait > 0:
+        flash(
+            f"Please wait {resend_wait} second(s) before requesting a new OTP.",
+            "warning",
+        )
+        return redirect(
+            url_for(
+                "verify_otp",
+                email=email,
+                role=role_slug,
+                purpose=purpose,
+            )
+        )
+
+    try:
+        issue_otp(user, purpose, role_slug)
+    except RuntimeError as exc:
+        clear_otp_context()
+        flash(str(exc), "danger")
+        if purpose == OTP_PURPOSE_REGISTRATION:
+            return redirect(role_register_url(role_slug))
+        return redirect(role_login_url(role_slug))
     if not safe_commit("Unable to resend OTP right now. Please try again."):
         clear_otp_context()
         return redirect(role_login_url(role_slug))
 
-    flash("OTP resent. Please check your email or console.", "success")
+    if is_school_or_alumni_email(email):
+        flash("New OTP generated. Please use the on-screen OTP.", "success")
+    else:
+        flash("OTP resent. Please check your email.", "success")
     return redirect(
         url_for(
             "verify_otp",
@@ -1809,6 +2202,9 @@ def admin_reject_account(user_id):
 def admin_event_rsvp_analytics():
     events_list = Event.query.order_by(Event.event_date.desc()).all()
     event_ids = [event.id for event in events_list]
+    selected_status = clean_text(request.args.get("status")).lower()
+    if selected_status not in RSVP_STATUSES:
+        selected_status = ""
 
     rows = []
     if event_ids:
@@ -1833,22 +2229,85 @@ def admin_event_rsvp_analytics():
     if selected_event_id:
         selected_event = Event.query.get(selected_event_id)
         if selected_event:
-            attendees = (
+            attendees_query = (
                 db.session.query(EventRSVP, User, AlumniProfile)
                 .join(User, EventRSVP.user_id == User.id)
                 .outerjoin(AlumniProfile, AlumniProfile.user_id == User.id)
                 .filter(EventRSVP.event_id == selected_event_id)
-                .order_by(EventRSVP.updated_at.desc())
-                .all()
             )
+            if selected_status:
+                attendees_query = attendees_query.filter(EventRSVP.status == selected_status)
+            attendees = attendees_query.order_by(EventRSVP.updated_at.desc()).all()
 
     return render_template(
         "admin_event_rsvp_analytics.html",
         events=events_list,
         rsvp_counts=rsvp_counts,
         selected_event=selected_event,
+        selected_status=selected_status,
         attendees=attendees,
     )
+
+
+@app.route("/admin/events/<int:event_id>/rsvps/export")
+@role_required("admin", "osa")
+def admin_event_rsvp_export(event_id):
+    event = Event.query.get_or_404(event_id)
+    status_filter = clean_text(request.args.get("status")).lower()
+    if status_filter not in RSVP_STATUSES:
+        status_filter = ""
+
+    export_rows_query = (
+        db.session.query(EventRSVP, User, AlumniProfile)
+        .join(User, EventRSVP.user_id == User.id)
+        .outerjoin(AlumniProfile, AlumniProfile.user_id == User.id)
+        .filter(EventRSVP.event_id == event.id)
+    )
+    if status_filter:
+        export_rows_query = export_rows_query.filter(EventRSVP.status == status_filter)
+
+    export_rows = export_rows_query.order_by(EventRSVP.updated_at.desc()).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Event ID",
+            "Event Title",
+            "Event Date",
+            "User ID",
+            "Name",
+            "Email",
+            "Status",
+            "Submitted At",
+            "Last Updated",
+        ]
+    )
+    for row, user, profile in export_rows:
+        attendee_name = (
+            f"{clean_text(getattr(profile, 'first_name', ''))} "
+            f"{clean_text(getattr(profile, 'last_name', ''))}"
+        ).strip() or user.email
+        writer.writerow(
+            [
+                event.id,
+                event.title,
+                event.event_date.strftime("%Y-%m-%d %H:%M"),
+                user.id,
+                attendee_name,
+                user.email,
+                rsvp_status_label(row.status),
+                row.timestamp.strftime("%Y-%m-%d %H:%M:%S") if row.timestamp else "",
+                row.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+                if row.updated_at
+                else "",
+            ]
+        )
+
+    timestamp_label = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = f"event_{event.id}_rsvps_{timestamp_label}.csv"
+    response = Response(output.getvalue(), mimetype="text/csv")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 @app.route("/admin/system-reset", methods=["GET", "POST"])
@@ -2054,11 +2513,8 @@ def events():
             rsvp_counts[event_id][status] = count
 
     user_rsvp_map = {}
-    if (
-        current_user.is_authenticated
-        and to_role_slug(current_user.role, default=None) == "alumni"
-        and event_ids
-    ):
+    can_rsvp = can_user_submit_rsvp(current_user)
+    if can_rsvp and event_ids:
         user_rows = EventRSVP.query.filter(
             EventRSVP.user_id == current_user.id,
             EventRSVP.event_id.in_(event_ids),
@@ -2071,6 +2527,7 @@ def events():
         event_type=event_type,
         rsvp_counts=rsvp_counts,
         user_rsvp_map=user_rsvp_map,
+        can_rsvp=can_rsvp,
     )
 
 
@@ -2093,7 +2550,8 @@ def event_detail(event_id):
             rsvp_counts[status] = count
 
     user_rsvp = None
-    if current_user.is_authenticated and role_value == "alumni":
+    can_rsvp = can_user_submit_rsvp(current_user)
+    if can_rsvp:
         record = EventRSVP.query.filter_by(event_id=event.id, user_id=current_user.id).first()
         user_rsvp = record.status if record else None
 
@@ -2102,20 +2560,26 @@ def event_detail(event_id):
         event=event,
         rsvp_counts=rsvp_counts,
         user_rsvp=user_rsvp,
+        can_rsvp=can_rsvp,
     )
 
 
 @app.route("/events/<int:event_id>/rsvp", methods=["POST"])
-@role_required("alumni")
+@login_required
 def event_rsvp(event_id):
+    if not can_user_submit_rsvp(current_user):
+        flash("Your account is not authorized to RSVP for events.", "danger")
+        return redirect(url_for("event_detail", event_id=event_id))
+
     event = Event.query.get_or_404(event_id)
-    if not event.is_published:
+    role_slug = to_role_slug(current_user.role, default="alumni")
+    if not event.is_published and role_slug != "admin":
         flash("This event is not available for RSVP.", "warning")
         return redirect(url_for("events"))
 
     status = clean_text(request.form.get("status")).lower()
-    if status not in RSVP_STATUSES:
-        flash("Please select a valid RSVP response.", "danger")
+    if status not in RSVP_SUBMIT_STATUSES:
+        flash("Please select either Attending or Not Attending.", "danger")
         return redirect(url_for("event_detail", event_id=event.id))
 
     existing = EventRSVP.query.filter_by(event_id=event.id, user_id=current_user.id).first()
@@ -2125,7 +2589,11 @@ def event_rsvp(event_id):
         db.session.add(EventRSVP(event_id=event.id, user_id=current_user.id, status=status))
 
     if safe_commit("Unable to save RSVP right now. Please try again."):
-        flash("Your RSVP response has been saved.", "success")
+        flash(f"RSVP updated to {rsvp_status_label(status)}.", "success")
+
+    next_path = clean_text(request.form.get("next"))
+    if next_path.startswith("/"):
+        return redirect(next_path)
     return redirect(url_for("event_detail", event_id=event.id))
 
 
@@ -2832,19 +3300,24 @@ def admin_add_event():
     if request.method == "POST":
         title = clean_text(request.form.get("title"))
         event_date = parse_datetime_local(request.form.get("event_date"))
+        event_type = normalize_event_type(request.form.get("event_type"))
+        contact_email = clean_text(request.form.get("contact_email")).lower() or None
         if not title or not event_date:
             flash("Event title and date are required.", "danger")
+            return render_template("admin_edit_event.html", event=None)
+        if contact_email and not is_valid_email(contact_email):
+            flash("Please provide a valid contact email.", "danger")
             return render_template("admin_edit_event.html", event=None)
 
         event = Event(
             title=title,
             description=request.form.get("description", "").strip() or None,
-            event_type=request.form.get("event_type", "").strip() or None,
+            event_type=event_type,
             event_date=event_date,
             location=request.form.get("location", "").strip() or None,
             venue=request.form.get("venue", "").strip() or None,
             organizer=request.form.get("organizer", "").strip() or None,
-            contact_email=request.form.get("contact_email", "").strip() or None,
+            contact_email=contact_email,
             is_published=True,
         )
         db.session.add(event)
@@ -2861,17 +3334,22 @@ def admin_edit_event(event_id):
     if request.method == "POST":
         event.title = clean_text(request.form.get("title"))
         parsed_event_date = parse_datetime_local(request.form.get("event_date"))
+        event_type = normalize_event_type(request.form.get("event_type"))
+        contact_email = clean_text(request.form.get("contact_email")).lower() or None
         if not event.title or not parsed_event_date:
             flash("Event title and date are required.", "danger")
             return render_template("admin_edit_event.html", event=event)
+        if contact_email and not is_valid_email(contact_email):
+            flash("Please provide a valid contact email.", "danger")
+            return render_template("admin_edit_event.html", event=event)
 
         event.description = request.form.get("description", "").strip() or None
-        event.event_type = request.form.get("event_type", "").strip() or None
+        event.event_type = event_type
         event.event_date = parsed_event_date
         event.location = request.form.get("location", "").strip() or None
         event.venue = request.form.get("venue", "").strip() or None
         event.organizer = request.form.get("organizer", "").strip() or None
-        event.contact_email = request.form.get("contact_email", "").strip() or None
+        event.contact_email = contact_email
         event.is_published = True
         db.session.commit()
         flash("Event updated.", "success")

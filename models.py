@@ -190,12 +190,13 @@ class Event(db.Model):
     __table_args__ = (db.Index('ix_event_date_published', 'event_date', 'is_published'),)
 
 class EventRSVP(db.Model):
-    __tablename__ = 'event_rsvp'
+    __tablename__ = 'rsvps'
 
     id = db.Column(db.Integer, primary_key=True)
-    event_id = db.Column(db.Integer, db.ForeignKey('event.id'), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
+    event_id = db.Column(db.Integer, db.ForeignKey('event.id'), nullable=False, index=True)
     status = db.Column(db.String(20), nullable=False)  # attend / maybe / not_attend
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -203,8 +204,8 @@ class EventRSVP(db.Model):
     user = db.relationship('User', backref=db.backref('event_rsvps', lazy='dynamic', cascade='all, delete-orphan'))
 
     __table_args__ = (
-        db.UniqueConstraint('event_id', 'user_id', name='uq_event_rsvp_event_user'),
-        db.Index('ix_event_rsvp_status', 'status'),
+        db.UniqueConstraint('user_id', 'event_id', name='uq_rsvps_user_event'),
+        db.Index('ix_rsvps_status', 'status'),
     )
 
 class PasswordReset(db.Model):

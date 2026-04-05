@@ -44,7 +44,7 @@
                 <div class="profile-avatar-large">
                     <img src="{{ profile_photo_url(profile) }}" alt="Profile photo">
                 </div>
-                <div>
+                <div class="profile-info">
                     <h1>{{ profile.first_name or 'Alumni' }} {{ profile.last_name or '' }}</h1>
                     <p>{{ profile.degree or 'Degree not set' }}{% if profile.year_graduated %} - Class of {{ profile.year_graduated }}{% endif %}</p>
                     <div class="profile-badges">

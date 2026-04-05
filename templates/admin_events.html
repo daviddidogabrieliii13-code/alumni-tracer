@@ -37,7 +37,6 @@
                         <td>
                             {% set stats = rsvp_counts.get(event.id, {'attend': 0, 'maybe': 0, 'not_attend': 0}) %}
                             <span class="badge badge-success">A: {{ stats.get('attend', 0) }}</span>
-                            <span class="badge badge-info">M: {{ stats.get('maybe', 0) }}</span>
                             <span class="badge badge-warning">N: {{ stats.get('not_attend', 0) }}</span>
                         </td>
                         <td>

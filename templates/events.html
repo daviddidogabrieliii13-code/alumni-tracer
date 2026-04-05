@@ -7,14 +7,13 @@
     <div class="container">
         <div class="page-header-content">
             <h1>Upcoming Events</h1>
-            <p>Stay connected with alumni events, workshops, and gatherings</p>
+            <p>Stay connected through reunions, career fairs, workshops, and community gatherings.</p>
         </div>
     </div>
 </div>
 
-<div class="container" style="padding-bottom: var(--space-xxl);">
-    <!-- Event Filters -->
-    <div class="job-filters" style="margin-bottom: var(--space-xl);">
+<div class="container page-stack">
+    <section class="section-card">
         <form method="GET" action="{{ url_for('events') }}" class="filter-form">
             <select name="type" class="form-control">
                 <option value="">All Event Types</option>
@@ -24,78 +23,98 @@
                 <option value="gathering" {% if event_type == 'gathering' %}selected{% endif %}>Gathering</option>
             </select>
             <button type="submit" class="btn btn-primary">
-                <i class="fas fa-filter"></i> Filter
+                <i class="fas fa-filter"></i> Apply Filter
             </button>
+            <a href="{{ url_for('events') }}" class="btn btn-outline">Clear</a>
         </form>
-    </div>
+    </section>
 
-    <!-- Events Grid -->
+    {% set totals = namespace(attend=0, not_attend=0) %}
+    {% for event in events %}
+        {% set summary = rsvp_counts.get(event.id, {'attend': 0, 'maybe': 0, 'not_attend': 0}) %}
+        {% set totals.attend = totals.attend + summary.get('attend', 0) %}
+        {% set totals.not_attend = totals.not_attend + summary.get('not_attend', 0) %}
+    {% endfor %}
+
+    <section class="events-summary-grid">
+        <article class="summary-card">
+            <span class="summary-label">Upcoming Events</span>
+            <strong class="summary-value">{{ events|length }}</strong>
+        </article>
+        <article class="summary-card">
+            <span class="summary-label">Attending</span>
+            <strong class="summary-value">{{ totals.attend }}</strong>
+        </article>
+        <article class="summary-card">
+            <span class="summary-label">Not Attending</span>
+            <strong class="summary-value">{{ totals.not_attend }}</strong>
+        </article>
+    </section>
+
     {% if events %}
-    <div class="events-grid">
+    <section class="events-grid">
         {% for event in events %}
-        <div class="event-card">
-            <div class="event-image">
+        {% set stats = rsvp_counts.get(event.id, {'attend': 0, 'maybe': 0, 'not_attend': 0}) %}
+        {% set me = user_rsvp_map.get(event.id) %}
+        <article class="event-card event-card-v2">
+            <div class="event-card-top">
                 <div class="event-date-badge">
                     <div class="day">{{ event.event_date.strftime('%d') }}</div>
                     <div class="month">{{ event.event_date.strftime('%b') }}</div>
                 </div>
-                <i class="fas fa-calendar-alt" style="font-size: 4rem; color: white; opacity: 0.3;"></i>
-            </div>
-            <div class="event-content">
-                <span class="event-type">{{ event.event_type|replace('_', ' ')|title }}</span>
-                <h3 class="event-title">{{ event.title }}</h3>
-                <div class="event-details">
-                    {% set stats = rsvp_counts.get(event.id, {'attend': 0, 'maybe': 0, 'not_attend': 0}) %}
-                    <div class="event-detail">
-                        <i class="fas fa-user-check"></i>
-                        <span>{{ stats.get('attend', 0) }} Attend • {{ stats.get('maybe', 0) }} Maybe</span>
-                    </div>
-                    <div class="event-detail">
-                        <i class="fas fa-map-marker-alt"></i>
-                        <span>{{ event.location }}</span>
-                    </div>
-                    <div class="event-detail">
-                        <i class="fas fa-clock"></i>
-                        <span>{{ event.event_date.strftime('%I:%M %p') }}</span>
-                    </div>
-                    {% if event.venue %}
-                    <div class="event-detail">
-                        <i class="fas fa-building"></i>
-                        <span>{{ event.venue }}</span>
-                    </div>
-                    {% endif %}
+                <div class="event-top-meta">
+                    <span class="event-type">{{ (event.event_type or 'general')|replace('_', ' ')|title }}</span>
+                    <h3 class="event-title">{{ event.title }}</h3>
                 </div>
-                <p style="color: var(--text-secondary); margin-bottom: var(--space-md);">
-                    {{ (event.description[:150] ~ '...') if event.description else 'No event description available yet.' }}
-                </p>
-                {% if current_user.is_authenticated and current_role == 'alumni' %}
-                <p class="form-text">
-                    Your RSVP:
-                    {% set me = user_rsvp_map.get(event.id) %}
-                    {% if me == 'attend' %}
-                        Attend
-                    {% elif me == 'maybe' %}
-                        Maybe
-                    {% elif me == 'not_attend' %}
-                        Not Attend
-                    {% else %}
-                        Not set
-                    {% endif %}
-                </p>
-                {% endif %}
-                <a href="{{ url_for('event_detail', event_id=event.id) }}" class="btn btn-primary">
-                    <i class="fas fa-info-circle"></i> Details
-                </a>
             </div>
-        </div>
+
+            <div class="event-details">
+                <div class="event-detail"><i class="fas fa-calendar"></i><span>{{ event.event_date.strftime('%B %d, %Y') }} at {{ event.event_date.strftime('%I:%M %p') }}</span></div>
+                <div class="event-detail"><i class="fas fa-map-marker-alt"></i><span>{{ event.location or 'TBA' }}</span></div>
+                {% if event.venue %}
+                <div class="event-detail"><i class="fas fa-building"></i><span>{{ event.venue }}</span></div>
+                {% endif %}
+            </div>
+
+            <p class="event-description">{{ (event.description[:165] ~ '...') if event.description and event.description|length > 165 else (event.description or 'No event description available yet.') }}</p>
+
+            <div class="event-rsvp-stats">
+                <span><strong>{{ stats.get('attend', 0) }}</strong> Attending</span>
+                <span><strong>{{ stats.get('not_attend', 0) }}</strong> Not Attending</span>
+            </div>
+
+            {% if can_rsvp %}
+            <form method="POST" action="{{ url_for('event_rsvp', event_id=event.id) }}" class="rsvp-inline-form">
+                <input type="hidden" name="next" value="{{ request.full_path if request.full_path else request.path }}">
+                <div class="rsvp-button-group two-choice">
+                    <button type="submit" name="status" value="attend" class="rsvp-btn {% if me == 'attend' %}active{% endif %}">Attending</button>
+                    <button type="submit" name="status" value="not_attend" class="rsvp-btn {% if me == 'not_attend' %}active{% endif %}">Not Attending</button>
+                </div>
+                <p class="form-text">Current RSVP: <strong>{{ me|rsvp_label if me else 'Not Set' }}</strong></p>
+            </form>
+            {% elif not current_user.is_authenticated %}
+            <a href="{{ url_for('role_login', role='alumni', next=request.full_path if request.full_path else request.path) }}" class="btn btn-outline">
+                <i class="fas fa-sign-in-alt"></i> Sign In to RSVP
+            </a>
+            {% else %}
+            <div class="alert alert-info compact-alert">
+                <i class="fas fa-info-circle"></i>
+                <span>Your role is currently not allowed to RSVP for events.</span>
+            </div>
+            {% endif %}
+
+            <a href="{{ url_for('event_detail', event_id=event.id) }}" class="btn btn-primary">
+                <i class="fas fa-info-circle"></i> View Details
+            </a>
+        </article>
         {% endfor %}
-    </div>
+    </section>
     {% else %}
-    <div class="empty-state">
+    <section class="empty-state">
         <i class="fas fa-calendar-times"></i>
         <h3>No Events Found</h3>
-        <p>There are no upcoming events at this time. Check back later!</p>
-    </div>
+        <p>There are no upcoming events at this time. Check back again soon.</p>
+    </section>
     {% endif %}
 </div>
 {% endblock %}
