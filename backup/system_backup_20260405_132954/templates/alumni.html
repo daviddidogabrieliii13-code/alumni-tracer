@@ -3,17 +3,19 @@
 {% block title %}Alumni Directory - WVSU Alumni System{% endblock %}
 
 {% block content %}
-<div class="container alumni-directory-page">
-    <section class="directory-banner-card section-card" aria-labelledby="alumniDirectoryTitle">
-        <div class="directory-banner-head">
-            <span class="directory-kicker">Alumni Network</span>
-            <h1 id="alumniDirectoryTitle">Alumni Directory</h1>
+<div class="page-header">
+    <div class="container">
+        <div class="page-header-content">
+            <h1>Alumni Directory</h1>
             <p>Connect with fellow WVSU Pototan graduates</p>
         </div>
+    </div>
+</div>
 
-        <div class="directory-banner-divider" aria-hidden="true"></div>
-
-        <form method="GET" action="{{ url_for('alumni_directory') }}" class="filter-form directory-filter-form">
+<div class="container" style="padding-bottom: var(--space-xxl);">
+    <!-- Search & Filters -->
+    <div class="job-filters" style="margin-bottom: var(--space-xl);">
+        <form method="GET" action="{{ url_for('alumni_directory') }}" class="filter-form">
             <input type="text" name="search" class="form-control" placeholder="Search by name, course, or company..." value="{{ search if search else '' }}">
             <select name="degree" class="form-control">
                 <option value="">All Courses</option>
@@ -31,50 +33,38 @@
                 <i class="fas fa-search"></i> Search
             </button>
         </form>
-    </section>
+    </div>
 
+    <!-- Alumni Grid -->
     {% if alumni.items %}
-    <section class="alumni-grid alumni-directory-grid" aria-label="Alumni results">
+    <div class="alumni-grid">
         {% for alum in alumni.items %}
-        <article class="alumni-card">
-            <div class="alumni-card-header">
-                <div class="alumni-avatar" aria-hidden="true">
-                    {% set initials = (alum.first_name[0] if alum.first_name else '') ~ (alum.last_name[0] if alum.last_name else '') %}
-                    {{ initials if initials else 'AL' }}
-                </div>
-                <div class="alumni-card-intro">
-                    <h3 class="alumni-name">{{ alum.first_name }} {{ alum.last_name }}</h3>
-                    <p class="alumni-degree">{{ alum.degree }}</p>
-                    <span class="alumni-year">Class of {{ alum.year_graduated }}</span>
-                </div>
+        <div class="alumni-card">
+            <div class="alumni-avatar">
+                {{ alum.first_name[0] if alum.first_name }}{{ alum.last_name[0] if alum.last_name }}
             </div>
-
+            <h3 class="alumni-name">{{ alum.first_name }} {{ alum.last_name }}</h3>
+            <p class="alumni-degree">{{ alum.degree }}</p>
+            <span class="alumni-year">Class of {{ alum.year_graduated }}</span>
             {% if alum.employment_status == 'employed' or alum.employment_status == 'self-employed' %}
             <p class="alumni-job">
-                <i class="fas fa-briefcase"></i>
-                <span>
-                    {% if alum.job_position %}{{ alum.job_position }}{% endif %}
-                    {% if alum.current_employer %} at {{ alum.current_employer }}{% endif %}
-                </span>
-            </p>
-            {% else %}
-            <p class="alumni-job alumni-job-empty">
-                <i class="fas fa-briefcase"></i>
-                <span>Employment details are currently not available.</span>
+                <i class="fas fa-briefcase"></i> 
+                {% if alum.job_position %}{{ alum.job_position }}{% endif %}
+                {% if alum.current_employer %} at {{ alum.current_employer }}{% endif %}
             </p>
             {% endif %}
-
             <div class="alumni-actions">
                 <button class="btn btn-outline btn-sm">
                     <i class="fas fa-envelope"></i> Message
                 </button>
             </div>
-        </article>
+        </div>
         {% endfor %}
-    </section>
+    </div>
 
+    <!-- Pagination -->
     {% if alumni.has_prev or alumni.has_next %}
-    <nav class="pagination directory-pagination" aria-label="Directory pagination">
+    <div class="pagination">
         {% if alumni.has_prev %}
         <a href="{{ url_for('alumni_directory', page=alumni.prev_num, search=search, degree=degree_filter, year=year_filter) }}">&laquo;</a>
         {% endif %}
@@ -92,14 +82,14 @@
         {% if alumni.has_next %}
         <a href="{{ url_for('alumni_directory', page=alumni.next_num, search=search, degree=degree_filter, year=year_filter) }}">&raquo;</a>
         {% endif %}
-    </nav>
+    </div>
     {% endif %}
     {% else %}
-    <section class="empty-state section-card directory-empty-state">
+    <div class="empty-state">
         <i class="fas fa-users"></i>
         <h3>No Alumni Found</h3>
         <p>No alumni match your search criteria. Try adjusting your filters.</p>
-    </section>
+    </div>
     {% endif %}
 </div>
 {% endblock %}

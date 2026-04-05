@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+
+{% block title %}{{ event.title }} - Event Details{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div class="container">
+        <div class="page-header-content">
+            <h1>{{ event.title }}</h1>
+            <p>{{ (event.event_type or 'general')|replace('_', ' ')|title }}</p>
+        </div>
+    </div>
+</div>
+
+<div class="container page-stack">
+    <div class="event-detail-layout">
+        <article class="card event-detail-main-card">
+            <div class="card-body">
+                <span class="event-type">{{ (event.event_type or 'general')|replace('_', ' ')|title }}</span>
+                <h2 class="event-main-title">{{ event.title }}</h2>
+
+                <div class="event-meta-grid">
+                    <div class="event-meta-item">
+                        <i class="fas fa-calendar"></i>
+                        <div>
+                            <strong>Date</strong>
+                            <p>{{ event.event_date.strftime('%B %d, %Y') }}</p>
+                        </div>
+                    </div>
+                    <div class="event-meta-item">
+                        <i class="fas fa-clock"></i>
+                        <div>
+                            <strong>Time</strong>
+                            <p>{{ event.event_date.strftime('%I:%M %p') }}</p>
+                        </div>
+                    </div>
+                    <div class="event-meta-item">
+                        <i class="fas fa-map-marker-alt"></i>
+                        <div>
+                            <strong>Location</strong>
+                            <p>{{ event.location or 'TBA' }}</p>
+                        </div>
+                    </div>
+                    {% if event.venue %}
+                    <div class="event-meta-item">
+                        <i class="fas fa-building"></i>
+                        <div>
+                            <strong>Venue</strong>
+                            <p>{{ event.venue }}</p>
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+
+                {% if event.description %}
+                <section class="detail-block">
+                    <h3>About This Event</h3>
+                    <p>{{ event.description }}</p>
+                </section>
+                {% endif %}
+            </div>
+        </article>
+
+        <aside class="card event-detail-sidebar-card">
+            <div class="card-header">
+                <h3>RSVP Overview</h3>
+            </div>
+            <div class="card-body">
+                <div class="event-rsvp-stats stacked">
+                    <span><strong>{{ rsvp_counts.get('attend', 0) }}</strong> Attending</span>
+                    <span><strong>{{ rsvp_counts.get('not_attend', 0) }}</strong> Not Attending</span>
+                </div>
+
+                {% if can_rsvp %}
+                <form method="POST" action="{{ url_for('event_rsvp', event_id=event.id) }}" class="rsvp-form-card">
+                    <input type="hidden" name="next" value="{{ request.path }}">
+                    <label class="form-label">Your RSVP</label>
+                    <div class="rsvp-button-group two-choice vertical">
+                        <button type="submit" name="status" value="attend" class="rsvp-btn {% if user_rsvp == 'attend' %}active{% endif %}">Attending</button>
+                        <button type="submit" name="status" value="not_attend" class="rsvp-btn {% if user_rsvp == 'not_attend' %}active{% endif %}">Not Attending</button>
+                    </div>
+                    <p class="form-text">Current RSVP: <strong>{{ user_rsvp|rsvp_label if user_rsvp else 'Not Set' }}</strong></p>
+                </form>
+                {% elif not current_user.is_authenticated %}
+                <a href="{{ url_for('role_login', role='alumni', next=request.path) }}" class="btn btn-primary w-100">
+                    <i class="fas fa-sign-in-alt"></i> Sign In to RSVP
+                </a>
+                {% else %}
+                <div class="alert alert-info compact-alert">
+                    <i class="fas fa-info-circle"></i>
+                    <span>Your role is currently not allowed to RSVP for events.</span>
+                </div>
+                {% endif %}
+
+                {% if event.organizer %}
+                <div class="detail-block compact">
+                    <h4>Organizer</h4>
+                    <p>{{ event.organizer }}</p>
+                </div>
+                {% endif %}
+
+                {% if event.contact_email %}
+                <div class="detail-block compact">
+                    <h4>Contact</h4>
+                    <p>{{ event.contact_email }}</p>
+                </div>
+                {% endif %}
+            </div>
+        </aside>
+    </div>
+</div>
+{% endblock %}
